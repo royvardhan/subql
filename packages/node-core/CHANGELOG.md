@@ -5,6 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- A disconnected endpoint is retried with the wait between attempts capped at 60s, for a give-up window (`SUBQL_RECONNECT_GIVE_UP_MS`, default 30 min) rather than a fixed five attempts, so a node restart or maintenance window no longer drops the endpoint; a reconnected endpoint is selected again immediately (`updateNextConnectedApiIndex` on success, which also clears a stale cached endpoint). If it never heals within the window the endpoint is removed, which for the last endpoint still triggers the existing "all connections removed" exit. This applies to multi-endpoint pools only; with a single endpoint `handleApiError` short-circuits and this path is never reached, so single-endpoint resilience comes from the resilient websocket provider and the api service's fetch retry.
+- Block fetches retry up to 20 times with the wait capped at 30s so an RPC outage and the reconnect after it do not exit the process. This is what carries a single-endpoint deployment across an outage; it re-selects a connection each attempt.
+
 
 ## [19.3.1] - 2026-04-01
 ### Fixed

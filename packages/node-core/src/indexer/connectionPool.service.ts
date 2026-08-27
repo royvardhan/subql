@@ -10,12 +10,22 @@ import {ApiConnectionError, ApiErrorType} from '../api.connection.error';
 import {IApiConnectionSpecific} from '../api.service';
 import {NodeConfig} from '../configure';
 import {getLogger} from '../logger';
-import {backoffRetry, delay} from '../utils';
+import {delay} from '../utils';
 import {ConnectionPoolStateManager} from './connectionPoolState.manager';
 
 const logger = getLogger('connection-pool');
 
 const LOG_INTERVAL_MS = 60 * 1000; // Log every 60 seconds
+const MAX_RECONNECT_BACKOFF_SEC = 60;
+// A disconnected endpoint reconnects for this long before it is given up on and removed from the
+// pool. Long enough to ride out a node restart or maintenance window; bounded so an endpoint that
+// will never heal (revoked key, dead host) is eventually removed, which is what triggers the
+// "all endpoints removed" exit for the last one instead of retrying forever.
+const DEFAULT_RECONNECT_GIVE_UP_MS = 30 * 60 * 1000;
+function reconnectGiveUpMs(): number {
+  const override = Number(process.env.SUBQL_RECONNECT_GIVE_UP_MS);
+  return Number.isFinite(override) && override > 0 ? override : DEFAULT_RECONNECT_GIVE_UP_MS;
+}
 
 export const errorTypeToScoreAdjustment = {
   [ApiErrorType.Timeout]: -10,
@@ -132,30 +142,55 @@ export class ConnectionPoolService<T extends IApiConnectionSpecific<any, any, an
     return this.poolStateManager.numConnections;
   }
 
+  /**
+   * Reconnects a disconnected endpoint, backing off up to MAX_RECONNECT_BACKOFF_SEC between
+   * attempts, for up to the give-up window (SUBQL_RECONNECT_GIVE_UP_MS, default 30 min). While
+   * disconnected the endpoint is simply not selected for requests; a transient outage is expected
+   * to end well inside the window. If it does not, the endpoint is removed from the pool, which for
+   * the last remaining endpoint triggers the "all connections removed" exit rather than an endpoint
+   * that retries and logs forever.
+   *
+   * Only relevant to multi-endpoint pools: with a single endpoint `handleApiError` short-circuits
+   * (pool size 1) and never marks it disconnected, so this is never called. Single-endpoint
+   * resilience comes from the resilient websocket provider (which waits out the reconnect) and the
+   * api service's fetch retry.
+   */
   async handleApiDisconnects(endpoint: string): Promise<void> {
     logger.warn(`disconnected from ${endpoint}`);
 
-    const tryReconnect = async () => {
-      try {
-        logger.info(`Attempting to reconnect to ${endpoint}`);
+    const giveUpMs = reconnectGiveUpMs();
+    const deadline = Date.now() + giveUpMs;
 
-        await this.allApi[endpoint].apiConnect();
-        await this.poolStateManager.setFieldValue(endpoint, 'connected', true);
-        this.reconnectingEndpoints[endpoint] = undefined;
-        logger.info(`Reconnected to ${endpoint} successfully`);
-      } catch (e) {
-        logger.error(`Reconnection failed: ${e}`);
-        throw e;
+    const reconnect = async (): Promise<void> => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          logger.info(`Attempting to reconnect to ${endpoint} (attempt ${attempt + 1})`);
+
+          await this.allApi[endpoint].apiConnect();
+          await this.poolStateManager.setFieldValue(endpoint, 'connected', true);
+          this.reconnectingEndpoints[endpoint] = undefined;
+          await this.updateNextConnectedApiIndex();
+          logger.info(`Reconnected to ${endpoint} successfully`);
+          return;
+        } catch (e) {
+          if (Date.now() >= deadline) {
+            logger.error(
+              `Reconnection to ${endpoint} kept failing for ${Math.round(giveUpMs / 1000)}s, removing it from the pool: ${e}`
+            );
+            this.reconnectingEndpoints[endpoint] = undefined;
+            await this.poolStateManager.removeFromConnections(endpoint);
+            return;
+          }
+          const backoff = Math.min(Math.pow(2, attempt), MAX_RECONNECT_BACKOFF_SEC);
+          logger.error(`Reconnection to ${endpoint} failed, retrying in ${backoff}s: ${e}`);
+          await delay(backoff);
+        }
       }
     };
 
-    this.reconnectingEndpoints[endpoint] = backoffRetry(tryReconnect, 5).catch(async (e: any) => {
-      logger.error(`Reached max reconnection attempts. Removing connection ${endpoint} from pool.`);
-      await this.poolStateManager.removeFromConnections(endpoint);
-    });
+    this.reconnectingEndpoints[endpoint] = reconnect();
 
     await this.handleConnectionStateChange();
-    logger.info(`reconnected to ${endpoint}!`);
   }
 
   @Interval(LOG_INTERVAL_MS)

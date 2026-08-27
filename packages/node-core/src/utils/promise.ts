@@ -42,18 +42,26 @@ export function isBackoffError(error: any): error is BackoffError {
   return error instanceof BackoffError;
 }
 
-async function backoffRetryInternal<T>(fn: () => Promise<T>, maxAttempts: number, currentAttempt = 0): Promise<T> {
+async function backoffRetryInternal<T>(
+  fn: () => Promise<T>,
+  maxAttempts: number,
+  maxDelaySec: number,
+  currentAttempt = 0
+): Promise<T> {
   try {
     return await fn();
   } catch (e) {
     if (maxAttempts - 1 === currentAttempt) {
       throw new BackoffError(e, {cause: e});
     }
-    await delay(Math.pow(2, currentAttempt));
-    return backoffRetryInternal(fn, maxAttempts, currentAttempt + 1);
+    await delay(Math.min(Math.pow(2, currentAttempt), maxDelaySec));
+    return backoffRetryInternal(fn, maxAttempts, maxDelaySec, currentAttempt + 1);
   }
 }
 
-export async function backoffRetry<T>(fn: () => Promise<T>, attempts = 5): Promise<T> {
-  return backoffRetryInternal(fn, attempts);
+/**
+ * Retries fn with exponential backoff (1s, 2s, 4s, ...). maxDelaySec caps the wait between attempts.
+ */
+export async function backoffRetry<T>(fn: () => Promise<T>, attempts = 5, maxDelaySec = Infinity): Promise<T> {
+  return backoffRetryInternal(fn, attempts, maxDelaySec);
 }
