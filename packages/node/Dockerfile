@@ -1,5 +1,5 @@
 # Build stage
-FROM node:lts-alpine as builder
+FROM node:22-alpine as builder
 # Set working directory
 WORKDIR /app
 
@@ -16,10 +16,13 @@ COPY ./scripts/build.sh ./scripts/build.sh
 RUN ./scripts/build.sh packages/node
 
 # Production stage
-FROM node:lts-alpine
+FROM node:22-alpine
 
 # Copy .tgz file from builder
 COPY --from=builder /app/packages/node/app.tgz /app.tgz
+# node-core is installed from this checkout, see scripts/build.sh. Kept in the image because the
+# app package.json references it as file:./node-core.tgz.
+COPY --from=builder /app/packages/node/node-core.tgz /node-core.tgz
 
 # Install production dependencies
 RUN apk add --no-cache tini curl git && \

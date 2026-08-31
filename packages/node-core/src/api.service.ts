@@ -13,7 +13,11 @@ import {backoffRetry, isBackoffError} from './utils';
 
 const logger = getLogger('api');
 
-const MAX_RECONNECT_ATTEMPTS = 5;
+// A fetch keeps retrying for long enough to outlive an RPC outage and the reconnect that follows
+// it, with the wait between attempts capped so recovery is noticed promptly: 20 attempts with a
+// 30s cap is roughly eight minutes before the dispatcher gives up and exits.
+const MAX_RECONNECT_ATTEMPTS = 20;
+const MAX_RETRY_DELAY_SEC = 30;
 
 export interface IApi<A = any, SA = any, B extends Array<any> = any[]> {
   fetchBlocks(heights: number[], ...args: any): Promise<B>;
@@ -61,7 +65,7 @@ export abstract class ApiService<
 
   protected async retryFetch(fn: () => Promise<B>, numAttempts = MAX_RECONNECT_ATTEMPTS): Promise<B> {
     try {
-      return await backoffRetry(fn, numAttempts);
+      return await backoffRetry(fn, numAttempts, MAX_RETRY_DELAY_SEC);
     } catch (e) {
       if (isBackoffError(e)) {
         logger.error(e.message);

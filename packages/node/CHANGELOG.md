@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Providers no longer cache responses, so a rejected request promise is never replayed after a disconnect. The http provider's own cache and the `createCachedProvider` wrapper are gone. On the websocket side the resilient wrapper forces `isCacheable` off on every send, so the provider always issues a fresh request; `cacheCapacity: 0` alone does not reliably disable the cache on either 15.x or 16.x (its bypass checks a field left at the default), so forcing the flag is what guarantees it.
+- The http provider retries only transport failures and retryable HTTP statuses (429/502/503/504), with capped exponential backoff and honouring `Retry-After`; a `[429]` is reported as a rate limit. JSON-RPC application errors (an `RpcError`, e.g. invalid params or an oversized-response limit) are never retried, so they reach the connection pool immediately instead of after minutes of backoff.
+- A websocket request that fails because the connection dropped waits for the provider to reconnect and is sent again instead of failing the block, so an RPC outage no longer exits the process from either the block fetcher or a mapping handler. The wait defaults to five minutes (override with `SUBQL_WS_RECONNECT_WAIT_MS`): a mapping-handler read has no other retry, so the wait must outlast the outage; block fetches are additionally retried by the api service. A multi-endpoint pool only fails a dead endpoint over once the wait elapses, so lower it when several endpoints are configured. Subscription sends are passed through unchanged.
+- `apiConnect` waits for the provider's `connected` event with a timeout instead of hanging indefinitely, and no longer leaves an unhandled rejection when the provider is already reconnecting on its own.
+- Pin the Docker base image to `node:22-alpine` instead of the floating `node:lts-alpine`. The image installs without a lockfile and the mapping sandbox runs the deprecated `vm2`, which breaks (`Proxy is not a constructor`) on newer Node; pinning keeps the runtime on the version the sandbox is known to work on.
+
 
 ## [6.4.6] - 2025-11-26
 ### Fixed

@@ -87,18 +87,38 @@ describe('ConnectionPoolService', () => {
       expect(connectionPoolService.numConnections).toBe(1);
     }, 20000);
 
-    it('should handle failed reconnection after max attempts', async () => {
-      (mockApiConnection.apiConnect as any).mockImplementation(() => Promise.reject(new Error('Reconnection failed')));
+    it('keeps retrying across many failures within the give-up window and does not remove the connection', async () => {
+      (mockApiConnection.apiConnect as any)
+        .mockImplementationOnce(() => Promise.reject(new Error('Reconnection failed')))
+        .mockImplementationOnce(() => Promise.reject(new Error('Reconnection failed')))
+        .mockImplementationOnce(() => Promise.reject(new Error('Reconnection failed')))
+        .mockImplementation(() => Promise.resolve());
       const apiConnectSpy = jest.spyOn(mockApiConnection, 'apiConnect');
 
       (connectionPoolService as any).handleApiDisconnects(TEST_URL);
 
-      await waitFor(() => (mockApiConnection.apiConnect as any).mock.calls.length === 5);
-      expect(apiConnectSpy).toHaveBeenCalledTimes(5);
-      expect(connectionPoolService.numConnections).toBe(0);
+      await waitFor(() => (mockApiConnection.apiConnect as any).mock.calls.length === 4);
+      expect(apiConnectSpy).toHaveBeenCalledTimes(4);
+      expect(connectionPoolService.numConnections).toBe(1);
+      expect(allConnectionsRemoved).not.toHaveBeenCalled();
+    }, 50000);
 
-      // Application would exit under normal circumstances as there is only one connection
-      expect(allConnectionsRemoved).toHaveBeenCalledTimes(1);
+    it('gives up and removes the endpoint once the give-up window elapses, exiting on the last one', async () => {
+      const prev = process.env.SUBQL_RECONNECT_GIVE_UP_MS;
+      process.env.SUBQL_RECONNECT_GIVE_UP_MS = '1';
+      try {
+        (mockApiConnection.apiConnect as any).mockImplementation(() => Promise.reject(new Error('will never heal')));
+
+        (connectionPoolService as any).handleApiDisconnects(TEST_URL);
+
+        await waitFor(() => connectionPoolService.numConnections === 0);
+        expect(connectionPoolService.numConnections).toBe(0);
+        // Last endpoint removed, so the pool triggers the "all connections removed" exit.
+        expect(allConnectionsRemoved).toHaveBeenCalledTimes(1);
+      } finally {
+        if (prev === undefined) delete process.env.SUBQL_RECONNECT_GIVE_UP_MS;
+        else process.env.SUBQL_RECONNECT_GIVE_UP_MS = prev;
+      }
     }, 50000);
 
     it('should call handleApiDisconnects only once when multiple connection errors are triggered', async () => {

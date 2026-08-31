@@ -19,13 +19,13 @@ import {
 import { IEndpointConfig } from '@subql/types-core';
 import * as SubstrateUtil from '../utils/substrate';
 import { ApiAt, BlockContent, LightBlockContent } from './types';
-import { createCachedProvider } from './x-provider/cachedProvider';
 import { HttpProvider } from './x-provider/http';
+import { createResilientProvider } from './x-provider/resilient';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { version: packageVersion } = require('../../package.json');
 
 const RETRY_DELAY = 2_500;
+const CONNECT_TIMEOUT_MS = 30_000;
 
 export type FetchFunc =
   | typeof SubstrateUtil.fetchBlocksBatches
@@ -47,6 +47,7 @@ export class ApiPromiseConnection
   private constructor(
     public unsafeApi: ApiPromise,
     private fetchBlocksBatches: GetFetchFunc,
+    private endpoint: string,
   ) {
     this.networkMeta = {
       chain: unsafeApi.runtimeChain.toString(),
@@ -69,12 +70,16 @@ export class ApiPromiseConnection
       ...config.headers,
     };
 
+    // Neither provider caches responses (WsProvider cache capacity 0, HttpProvider has none).
+    // polkadot-js caches the request promise, a rejected one included, keyed by the request, so
+    // after a disconnect every retry of the same block replayed the stale "disconnected" error
+    // from memory instead of asking the node again and the endpoint never recovered.
     if (endpoint.startsWith('ws')) {
-      provider = createCachedProvider(
-        new WsProvider(endpoint, RETRY_DELAY, headers),
+      provider = createResilientProvider(
+        new WsProvider(endpoint, RETRY_DELAY, headers, undefined, 0),
       );
     } else if (endpoint.startsWith('http')) {
-      provider = createCachedProvider(new HttpProvider(endpoint, headers));
+      provider = new HttpProvider(endpoint, headers);
       throwOnConnect = true;
     } else {
       throw new Error(`Invalid endpoint: ${endpoint}`);
@@ -87,7 +92,7 @@ export class ApiPromiseConnection
       ...args.chainTypes,
     };
     const api = await ApiPromise.create(apiOption);
-    return new ApiPromiseConnection(api, fetchBlocksBatches);
+    return new ApiPromiseConnection(api, fetchBlocksBatches, endpoint);
   }
 
   safeApi(height: number): ApiAt {
@@ -106,18 +111,39 @@ export class ApiPromiseConnection
     return blocks;
   }
 
+  /**
+   * Resolves once the provider reports connected, or rejects after CONNECT_TIMEOUT_MS so the
+   * caller can back off and try again. The websocket provider reconnects on its own after a
+   * drop, so connect() may throw "already connected" while that is in flight; the connected
+   * event still fires and is what this waits for.
+   */
   async apiConnect(): Promise<void> {
-    return new Promise<void>((resolve) => {
+    if (this.unsafeApi.isConnected) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const onConnected = () => {
+        cleanup();
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Timed out after ${CONNECT_TIMEOUT_MS}ms connecting to ${this.endpoint}`,
+          ),
+        );
+      }, CONNECT_TIMEOUT_MS);
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.unsafeApi.off('connected', onConnected);
+      };
+
+      this.unsafeApi.on('connected', onConnected);
+      this.unsafeApi.connect().catch(() => undefined);
       if (this.unsafeApi.isConnected) {
-        resolve();
-      }
-
-      this.unsafeApi.on('connected', () => {
-        resolve();
-      });
-
-      if (!this.unsafeApi.isConnected) {
-        this.unsafeApi.connect();
+        onConnected();
       }
     });
   }
@@ -144,7 +170,10 @@ export class ApiPromiseConnection
       formatted_error = new TimeoutError(e);
     } else if (e.message.startsWith(`disconnected from `)) {
       formatted_error = new DisconnectionError(e);
-    } else if (e.message.startsWith(`-32029: Too Many Requests`)) {
+    } else if (
+      e.message.startsWith(`-32029: Too Many Requests`) ||
+      e.message.startsWith(`[429]`)
+    ) {
       formatted_error = new RateLimitError(e);
     } else if (e.message.includes(`Exceeded max limit of`)) {
       formatted_error = new LargeResponseError(e);
