@@ -28,6 +28,7 @@ export interface MetadataKeys {
   dynamicDatasources: DatasourceParams[];
   unfinalizedBlocks: string;
   schemaMigrationCount: number;
+  appliedSchemaSDL: string;
   deployments: string;
   lastCreatedPoiHeight: number;
   latestSyncedPoiHeight: number;

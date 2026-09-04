@@ -11,6 +11,7 @@ import {
   MULTI_METADATA_REGEX,
   hexToU8a,
   GraphQLModelsType,
+  buildSchemaFromString,
 } from '@subql/utils';
 import {
   IndexesOptions,
@@ -203,7 +204,48 @@ export class StoreService {
        */
       const schemaMigrationService = new SchemaMigrationService(this.sequelize, this, schema, this.config);
 
-      await schemaMigrationService.run(null, this.subqueryProject.schema, tx);
+      // In-place schema migration: with allowSchemaMigration enabled, diff the previously
+      // applied schema (persisted in metadata) against the current one so additive changes
+      // on existing entities are ALTERed in place instead of only creating missing tables.
+      // A null baseline (fresh DB, or feature disabled) keeps the create-if-missing behaviour.
+      // The baseline is read and written through the raw metadata repo in this transaction so
+      // it commits atomically with the DDL, rather than via the write-back cache.
+      const storedRow = this.config.allowSchemaMigration
+        ? ((await this.metaDataRepo.findOne({where: {key: 'appliedSchemaSDL'}, transaction: tx})) as {
+            value: string;
+          } | null)
+        : null;
+      const storedSDL = storedRow?.value;
+      const baselineSchema = storedSDL ? buildSchemaFromString(storedSDL) : null;
+
+      if (
+        baselineSchema &&
+        !SchemaMigrationService.validateSchemaChanges(baselineSchema, this.subqueryProject.schema) &&
+        process.env.SUBQL_ALLOW_DESTRUCTIVE_MIGRATION !== 'true'
+      ) {
+        const {modifiedModels, removedModels} = SchemaMigrationService.schemaComparator(
+          baselineSchema,
+          this.subqueryProject.schema
+        );
+        const removedEntities = removedModels.map((m) => m.name);
+        const removedFields = Object.entries(modifiedModels).flatMap(([name, m]) =>
+          m.removedFields.map((f) => `${name}.${f.name}`)
+        );
+        throw new Error(
+          `Destructive schema migration is not allowed by default. ` +
+            `Removed entities: [${removedEntities.join(', ')}]; removed or retyped fields: [${removedFields.join(', ')}]. ` +
+            `Dropping or changing the type of a field drops its column and its data. ` +
+            `Add a new field instead, or set SUBQL_ALLOW_DESTRUCTIVE_MIGRATION=true to proceed.`
+        );
+      }
+
+      await schemaMigrationService.run(baselineSchema, this.subqueryProject.schema, tx);
+
+      if (this.config.allowSchemaMigration) {
+        await this.metaDataRepo.upsert({key: 'appliedSchemaSDL', value: this.subqueryProject.schemaSDL} as any, {
+          transaction: tx,
+        });
+      }
 
       const deploymentsRaw = await this.metadataModel.find('deployments');
       const deployments = deploymentsRaw ? JSON.parse(deploymentsRaw) : {};

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A websocket request that fails because the connection dropped waits for the provider to reconnect and is sent again instead of failing the block, so an RPC outage no longer exits the process from either the block fetcher or a mapping handler. The wait defaults to five minutes (override with `SUBQL_WS_RECONNECT_WAIT_MS`): a mapping-handler read has no other retry, so the wait must outlast the outage; block fetches are additionally retried by the api service. A multi-endpoint pool only fails a dead endpoint over once the wait elapses, so lower it when several endpoints are configured. Subscription sends are passed through unchanged.
 - `apiConnect` waits for the provider's `connected` event with a timeout instead of hanging indefinitely, and no longer leaves an unhandled rejection when the provider is already reconnecting on its own.
 - Pin the Docker base image to `node:22-alpine` instead of the floating `node:lts-alpine`. The image installs without a lockfile and the mapping sandbox runs the deprecated `vm2`, which breaks (`Proxy is not a constructor`) on newer Node; pinning keeps the runtime on the version the sandbox is known to work on.
+- Run with `--allow-schema-migration` to apply additive schema changes to existing entities in place on restart (see node-core), so adding a field to an entity no longer drops its existing data.
 
 
 ## [6.4.6] - 2025-11-26
