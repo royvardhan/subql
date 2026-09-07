@@ -94,7 +94,12 @@ export class SchemaMigrationService {
 
     if (!hasChanged(schemaDifference)) {
       logger.info('No Schema changes');
-      return;
+      // A null baseline is the create-if-missing path and has nothing to do here. With a real
+      // baseline we must still fall through to define this boot's models: unchanged entities
+      // are otherwise never registered, and every store access would then throw.
+      if (currentSchema === null) {
+        return;
+      }
     }
 
     const sortedSchemaModels = this.orderModelsByRelations(
@@ -114,6 +119,13 @@ export class SchemaMigrationService {
     }
 
     try {
+      // Define models the diff does not touch, so unchanged entities exist at runtime and for
+      // any new relation that references them. Only needed when migrating from a baseline; the
+      // null path defines every model via createTable.
+      if (currentSchema !== null) {
+        this.defineUnchangedModels(migrationAction, sortedSchemaModels, schemaDifference);
+      }
+
       for (const enumValue of addedEnums) {
         migrationAction.createEnum(enumValue);
       }
@@ -178,6 +190,26 @@ export class SchemaMigrationService {
     } catch (e: any) {
       logger.error(e, 'Failed to execute Schema Migration');
       throw e;
+    }
+  }
+
+  // Registers the models the diff leaves untouched. Added and modified models are defined by
+  // their own DDL, so they are excluded here to avoid redefining them.
+  private defineUnchangedModels(
+    migrationAction: Migration,
+    schemaModels: GraphQLModelsType[],
+    schemaDifference: SchemaChangesType
+  ): void {
+    const {addedModels, modifiedModels, removedModels} = schemaDifference;
+    const changedModelNames = new Set<string>([
+      ...addedModels.map((m) => m.name),
+      ...Object.keys(modifiedModels),
+      ...removedModels.map((m) => m.name),
+    ]);
+    for (const model of schemaModels) {
+      if (!changedModelNames.has(model.name)) {
+        migrationAction.defineModel(model);
+      }
     }
   }
 }

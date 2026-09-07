@@ -35,9 +35,38 @@ const SDL_V3 = `type Account @entity {
   nickname: String
 }`;
 
-// Runs the startup schema sync (StoreService.init) for a given SDL, the same call the
-// node makes on boot. A fresh StoreService each time mirrors a process restart.
-async function initSchema(schemaName: string, sdl: string, sequelize: Sequelize, config: NodeConfig): Promise<void> {
+// Additive: a new entity holding a relation to the unchanged Account entity
+const SDL_REL = `type Account @entity {
+  id: ID!
+  balance: BigInt!
+}
+
+type Transfer @entity {
+  id: ID!
+  account: Account!
+}`;
+
+// historical:false mirrors the substrate node in single-chain tests; the historical variant is
+// covered separately.
+const migrationConfig = new NodeConfig({allowSchemaMigration: true, historical: false} as any);
+
+function newSequelize(): Sequelize {
+  return new Sequelize(
+    `postgresql://${option.username}:${option.password}@${option.host}:${option.port}/${option.database}`,
+    {...option, logging: false}
+  );
+}
+
+// Boots a node against an existing db-schema with its OWN Sequelize instance, so no model
+// definitions leak between boots — a boot only has the models it defines during init, exactly
+// like a process restart. Returns the instance so the test can inspect it and close it.
+async function bootNode(
+  schemaName: string,
+  sdl: string,
+  config: NodeConfig
+): Promise<{sequelize: Sequelize; storeService: StoreService}> {
+  const sequelize = newSequelize();
+  await sequelize.authenticate();
   const project = {
     schema: buildSchemaFromString(sdl),
     schemaSDL: sdl,
@@ -58,6 +87,7 @@ async function initSchema(schemaName: string, sdl: string, sequelize: Sequelize,
     await tx.rollback().catch(() => undefined);
     throw e;
   }
+  return {sequelize, storeService};
 }
 
 async function columns(sequelize: Sequelize, schemaName: string, table: string) {
@@ -69,16 +99,12 @@ async function columns(sequelize: Sequelize, schemaName: string, table: string) 
 
 jest.setTimeout(900000);
 describe('In-place schema migration on startup', () => {
+  // A separate connection for setup, raw inserts, and assertions, independent of any boot.
   let sequelize: Sequelize;
   let schemaName: string;
-  // historical:false mirrors the substrate node, which runs without --historical
-  const migrationConfig = new NodeConfig({allowSchemaMigration: true, historical: false} as any);
 
   beforeEach(async () => {
-    sequelize = new Sequelize(
-      `postgresql://${option.username}:${option.password}@${option.host}:${option.port}/${option.database}`,
-      {...option, logging: false}
-    );
+    sequelize = newSequelize();
     await sequelize.authenticate();
     schemaName = `test_inplace_${Date.now()}`;
     await sequelize.createSchema(`"${schemaName}"`, {});
@@ -90,21 +116,24 @@ describe('In-place schema migration on startup', () => {
     await sequelize?.close();
   });
 
-  it('adds a nullable field to an existing entity in place and preserves rows', async () => {
-    await initSchema(schemaName, SDL_V1, sequelize, migrationConfig);
-
+  it('adds a nullable field in place, preserves rows, and keeps every model defined', async () => {
+    const boot1 = await bootNode(schemaName, SDL_V1, migrationConfig);
     // The applied schema is recorded so the next boot has a baseline to diff against
     const [seeded] = await sequelize.query<{value: string}>(
       `SELECT value FROM "${schemaName}"._metadata WHERE key = 'appliedSchemaSDL';`,
       {type: QueryTypes.SELECT}
     );
     expect(seeded.value).toEqual(SDL_V1);
+    await boot1.sequelize.close();
 
     // Seed data under the v1 schema
     await sequelize.query(`INSERT INTO "${schemaName}"."accounts" (id, balance) VALUES ('acc-1', 100);`);
 
-    // Restart with the additive schema
-    await initSchema(schemaName, SDL_V2, sequelize, migrationConfig);
+    // Restart (fresh Sequelize) with the additive schema
+    const boot2 = await bootNode(schemaName, SDL_V2, migrationConfig);
+
+    // The partial diff must still leave every model defined on this fresh instance
+    expect(() => boot2.sequelize.model('Account')).not.toThrow();
 
     const cols = await columns(sequelize, schemaName, 'accounts');
     const nickname = cols.find((c) => c.column_name === 'nickname');
@@ -127,17 +156,47 @@ describe('In-place schema migration on startup', () => {
       {type: QueryTypes.SELECT}
     );
     expect(updated.value).toEqual(SDL_V2);
+    await boot2.sequelize.close();
+  });
+
+  it('keeps every model defined on a restart with no schema change', async () => {
+    const boot1 = await bootNode(schemaName, SDL_V1, migrationConfig);
+    await boot1.sequelize.close();
+
+    // Second boot, identical schema, fresh Sequelize: the "No Schema changes" path must still
+    // register the models or every store access throws "Account has not been defined".
+    const boot2 = await bootNode(schemaName, SDL_V1, migrationConfig);
+    expect(() => boot2.sequelize.model('Account')).not.toThrow();
+    await boot2.sequelize.close();
+  });
+
+  it('adds a relation to an unchanged entity without crashing at boot', async () => {
+    const boot1 = await bootNode(schemaName, SDL_V1, migrationConfig);
+    await boot1.sequelize.close();
+
+    // Adding Transfer with a relation to the unchanged Account: createRelation resolves
+    // sequelize.model('Account'), which only exists if unchanged models are defined first.
+    const boot2 = await bootNode(schemaName, SDL_REL, migrationConfig);
+    expect(() => boot2.sequelize.model('Account')).not.toThrow();
+    expect(() => boot2.sequelize.model('Transfer')).not.toThrow();
+
+    // The new table exists and carries the relation's foreign-key column
+    const transferCols = await columns(sequelize, schemaName, 'transfers');
+    expect(transferCols.length).toBeGreaterThan(0);
+    expect(transferCols.find((c) => c.column_name === 'account_id')).toBeDefined();
+    await boot2.sequelize.close();
   });
 
   it('refuses a destructive change by default and leaves the column intact', async () => {
-    await initSchema(schemaName, SDL_V1, sequelize, migrationConfig);
+    const boot1 = await bootNode(schemaName, SDL_V1, migrationConfig);
+    await boot1.sequelize.close();
     await sequelize.query(`INSERT INTO "${schemaName}"."accounts" (id, balance) VALUES ('acc-1', 100);`);
 
     const exitSpy = jest.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`process.exit:${code}`);
     }) as any);
 
-    await expect(initSchema(schemaName, SDL_V3, sequelize, migrationConfig)).rejects.toThrow('process.exit:1');
+    await expect(bootNode(schemaName, SDL_V3, migrationConfig)).rejects.toThrow('process.exit:1');
 
     // The dropped-in-schema column and its data are still there
     const cols = await columns(sequelize, schemaName, 'accounts');
@@ -149,19 +208,22 @@ describe('In-place schema migration on startup', () => {
   });
 
   it('applies a destructive change when explicitly opted in', async () => {
-    await initSchema(schemaName, SDL_V1, sequelize, migrationConfig);
+    const boot1 = await bootNode(schemaName, SDL_V1, migrationConfig);
+    await boot1.sequelize.close();
     process.env.SUBQL_ALLOW_DESTRUCTIVE_MIGRATION = 'true';
 
-    await initSchema(schemaName, SDL_V3, sequelize, migrationConfig);
+    const boot2 = await bootNode(schemaName, SDL_V3, migrationConfig);
 
     const cols = await columns(sequelize, schemaName, 'accounts');
     expect(cols.find((c) => c.column_name === 'balance')).toBeUndefined();
     expect(cols.find((c) => c.column_name === 'nickname')).toBeDefined();
+    await boot2.sequelize.close();
   });
 
   it('does not migrate in place when the feature is disabled', async () => {
     const plainConfig = new NodeConfig({allowSchemaMigration: false, historical: false} as any);
-    await initSchema(schemaName, SDL_V1, sequelize, plainConfig);
+    const boot1 = await bootNode(schemaName, SDL_V1, plainConfig);
+    await boot1.sequelize.close();
 
     // No baseline is recorded, so a later boot cannot diff and add the column
     const seeded = await sequelize.query(
@@ -170,22 +232,25 @@ describe('In-place schema migration on startup', () => {
     );
     expect(seeded).toHaveLength(0);
 
-    await initSchema(schemaName, SDL_V2, sequelize, plainConfig);
+    const boot2 = await bootNode(schemaName, SDL_V2, plainConfig);
     const cols = await columns(sequelize, schemaName, 'accounts');
     expect(cols.find((c) => c.column_name === 'nickname')).toBeUndefined();
+    await boot2.sequelize.close();
   });
 
   // The multichain substrate node forces historical=timestamp, so the tables carry a _block_range.
   // This is the mode the real deployment runs in, verified live; keep it covered as a regression.
   it('adds a field in place under historical indexing and preserves rows', async () => {
     const historicalConfig = new NodeConfig({allowSchemaMigration: true, historical: 'timestamp'} as any);
-    await initSchema(schemaName, SDL_V1, sequelize, historicalConfig);
+    const boot1 = await bootNode(schemaName, SDL_V1, historicalConfig);
+    await boot1.sequelize.close();
 
     await sequelize.query(
       `INSERT INTO "${schemaName}"."accounts" (id, balance, _id, _block_range) VALUES ('acc-1', 100, gen_random_uuid(), int8range(1, NULL));`
     );
 
-    await initSchema(schemaName, SDL_V2, sequelize, historicalConfig);
+    const boot2 = await bootNode(schemaName, SDL_V2, historicalConfig);
+    expect(() => boot2.sequelize.model('Account')).not.toThrow();
 
     const cols = await columns(sequelize, schemaName, 'accounts');
     const nickname = cols.find((c) => c.column_name === 'nickname');
@@ -200,5 +265,6 @@ describe('In-place schema migration on startup', () => {
     );
     expect(rows).toHaveLength(1);
     expect(rows[0].nickname).toBeNull();
+    await boot2.sequelize.close();
   });
 });
