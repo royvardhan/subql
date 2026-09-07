@@ -46,6 +46,7 @@ export class BaseSubqueryProject<
     readonly templates: TemplateDS[],
     private blockHandlerKind: string,
     private isRuntimeDs: IsRuntimeDs<any>,
+    readonly schemaSDL: string,
     readonly runner?: RunnerSpecs,
     readonly parent?: ParentProject
   ) {
@@ -114,6 +115,7 @@ export class BaseSubqueryProject<
       templates,
       config.blockHandlerKind,
       config.isRuntimeDs,
+      schemaString,
       runner,
       manifest.parent
     ) as Project;

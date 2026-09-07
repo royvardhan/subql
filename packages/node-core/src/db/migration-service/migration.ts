@@ -145,6 +145,17 @@ export class Migration {
     return this.storeService.defineModel(model, attributes, indexes, this.schemaName);
   }
 
+  // Registers an entity's Sequelize model in memory without emitting any DDL. A baseline
+  // migration only touches changed entities, so unchanged ones must be defined here or they
+  // are missing at runtime (the null-baseline path defined them all as a side effect of
+  // createTable). Skips entities already defined so it is safe to call more than once.
+  defineModel(model: GraphQLModelsType): void {
+    if (this.sequelize.isDefined(model.name)) {
+      return;
+    }
+    this.addModelToSequelizeCache(this.createSequelizeModel(model));
+  }
+
   async createTable(model: GraphQLModelsType, withoutForeignKey: boolean): Promise<void> {
     const {attributes, indexes} = this.prepareModelAttributesAndIndexes(model);
     const existedIndexes = this.existingIndexes.map((i) => (i as any).indexname);
