@@ -13,13 +13,17 @@ import {NodeConfig} from '../configure';
 import {createRewindTrigger, createRewindTriggerFunction, getTriggers} from '../db';
 import {MultiChainRewindEvent} from '../events';
 import {getLogger} from '../logger';
-import {mainThreadOnly} from '../utils';
+import {delay, mainThreadOnly} from '../utils';
 import {MultiChainRewindStatus} from './entities';
 import {StoreService} from './store.service';
-import {PlainGlobalModel} from './storeModelProvider/global/global';
+import {MULTICHAIN_REWIND_LOCK_KEY, PlainGlobalModel} from './storeModelProvider/global/global';
 import {Header} from './types';
 
 const logger = getLogger('MultiChainRewindService');
+
+// Minimum time between two reads of the lock table when syncing status from the database
+const STATUS_SYNC_INTERVAL_MS = 3000;
+const LISTENER_RECONNECT_MAX_DELAY_SEC = 30;
 
 /**
  * Working principle:
@@ -27,6 +31,9 @@ const logger = getLogger('MultiChainRewindService');
  * When global.rewindLock changes, a PG trigger sends a notification, and all subscribed chain projects will receive the rollback notification.
  * This triggers a rollback process, where the fetch service handles the message by clearing the queue.
  * During the next fillNextBlockBuffer loop, if it detects the rewinding state, it will execute the rollback.
+ *
+ * Notifications are only a fast path. The fetch service also re-reads the lock table through syncStatusFromDb so a
+ * notification lost to a dropped listener connection or a restart never leaves the chain waiting forever.
  */
 @Injectable()
 export class MultiChainRewindService implements OnApplicationShutdown {
@@ -39,6 +46,9 @@ export class MultiChainRewindService implements OnApplicationShutdown {
   private pgListener?: PoolClient;
   private _globalModel?: PlainGlobalModel = undefined;
   private processingPromise: Promise<void> = Promise.resolve();
+  private enabled = false;
+  private lastStatusSync = 0;
+  private _waitingFor: string[] = [];
   waitRewindHeader?: Header;
   constructor(
     private nodeConfig: NodeConfig,
@@ -68,6 +78,11 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     return this._status;
   }
 
+  // Chains that still have to complete the current rewind, as of the last read of the lock table
+  get waitingFor(): string[] {
+    return this._waitingFor;
+  }
+
   get globalModel(): PlainGlobalModel {
     if (!this._globalModel) {
       this._globalModel = new PlainGlobalModel(this.dbSchema, this.chainId, this.storeService.globalDataRepo);
@@ -95,6 +110,7 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     if (!this.storeService.isMultichain) return;
     if (this.disableRewindLock) {
       logger.info(`Multichain rewind lock is disabled, chainId: ${this.chainId}`);
+      await this.registerParticipation(false);
       return;
     }
 
@@ -108,8 +124,15 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     assert(startHeight !== undefined, 'startHeight is not set');
     this.startHeight = startHeight;
 
+    await this.registerParticipation(true);
+    this.enabled = true;
+
     // Register a listener and create a schema notification sending function.
     await this.registerPgListener();
+
+    // Check whether the current state is in rollback.
+    // If a global lock situation occurs, prioritize setting it to the WaitOtherChain state. If a rollback is still required, then set it to the rewinding state.
+    await this.syncStatusFromDb(true);
 
     if (this.waitRewindHeader) {
       const rewindHeader = {...this.waitRewindHeader};
@@ -118,31 +141,58 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     }
   }
 
-  private async registerPgListener() {
+  /**
+   * Other chains only enroll this chain in a rewind when this key is true, so it is written straight to the table
+   * rather than through the store cache, which is not flushed until later in startup.
+   */
+  private async registerParticipation(participates: boolean): Promise<void> {
+    await this.storeService.modelProvider.metadata.model.upsert({key: MULTICHAIN_REWIND_LOCK_KEY, value: participates});
+  }
+
+  private async registerPgListener(): Promise<void> {
     if (this.pgListener) return;
 
     // Creating a new pgClient is to avoid using the same database connection as the block scheduler,
     // which may prevent real-time listening to rollback events.
-    this.pgListener = (await this.sequelize.connectionManager.getConnection({
+    const listener = (await this.sequelize.connectionManager.getConnection({
       type: 'read',
     })) as PoolClient;
+    this.pgListener = listener;
 
-    this.pgListener.on('notification', this.notifyHandle.bind(this));
+    listener.on('notification', this.notifyHandle.bind(this));
+    listener.on('error', (e) => void this.onListenerLost(listener, e));
+    listener.on('end', () => void this.onListenerLost(listener, new Error('connection ended')));
 
-    await this.pgListener.query(`LISTEN "${this.rewindTriggerName}"`);
+    await listener.query(`LISTEN "${this.rewindTriggerName}"`);
     logger.info(`Register rewind listener success, chainId: ${this.chainId}`);
+  }
 
-    // Check whether the current state is in rollback.
-    // If a global lock situation occurs, prioritize setting it to the WaitOtherChain state. If a rollback is still required, then set it to the rewinding state.
-    const chainRewindInfo = await this.globalModel.getChainRewindInfo();
-    if (!chainRewindInfo) return;
-
-    if (chainRewindInfo.status === MultiChainRewindStatus.Complete) {
-      this.status = MultiChainRewindStatus.Complete;
+  /**
+   * The pool keeps a dead listener connection checked out, so notifications sent after it dropped would be lost.
+   * Replace it, then read the lock table because the state may have moved while the listener was down.
+   */
+  private async onListenerLost(listener: PoolClient, e: Error): Promise<void> {
+    if (this._shutdown || this.pgListener !== listener) return;
+    logger.warn(`Rewind listener connection lost, chainId: ${this.chainId}: ${e.message}`);
+    this.pgListener = undefined;
+    try {
+      await this.sequelize.connectionManager.destroyConnection(listener as Connection);
+    } catch (destroyErr: any) {
+      logger.debug(`Failed to destroy rewind listener connection: ${destroyErr.message}`);
     }
-    if (chainRewindInfo.status === MultiChainRewindStatus.Incomplete) {
-      this.status = MultiChainRewindStatus.Incomplete;
-      this.waitRewindHeader = await this.searchWaitRewindHeader(chainRewindInfo.rewindTimestamp);
+
+    for (let attempt = 1; !this._shutdown; attempt++) {
+      try {
+        await this.registerPgListener();
+        await this.syncStatusFromDb(true);
+        return;
+      } catch (registerErr: any) {
+        const wait = Math.min(attempt, LISTENER_RECONNECT_MAX_DELAY_SEC);
+        logger.warn(
+          `Failed to re-register rewind listener (attempt ${attempt}): ${registerErr.message}, retry in ${wait}s`
+        );
+        await delay(wait);
+      }
     }
   }
 
@@ -176,6 +226,42 @@ export class MultiChainRewindService implements OnApplicationShutdown {
       }
       logger.info(`[${sessionUuid}]Handle success rewind event: ${eventType}, chainId: ${this.chainId}`);
     });
+  }
+
+  /**
+   * Bring the in-memory status in line with the lock table. Reads are throttled to STATUS_SYNC_INTERVAL_MS unless
+   * forced, and serialised with notification handling so the two cannot interleave. No-op when the lock is not in use.
+   */
+  async syncStatusFromDb(force = false): Promise<void> {
+    if (!this.enabled) return;
+    if (!force && Date.now() - this.lastStatusSync < STATUS_SYNC_INTERVAL_MS) return;
+    this.lastStatusSync = Date.now();
+
+    this.processingPromise = this.processingPromise.then(async () => {
+      if (this._shutdown) return;
+      try {
+        const chains = await this.globalModel.listChains();
+        const own = chains.find((chain) => chain.chainId === this.chainId);
+        this._waitingFor = chains
+          .filter((chain) => chain.status === MultiChainRewindStatus.Incomplete)
+          .map((chain) => chain.chainId);
+
+        if (!own) {
+          if (this.status !== MultiChainRewindStatus.Normal) {
+            logger.info(`Rewind lock released, chainId: ${this.chainId}`);
+          }
+          await this.setStatus(MultiChainRewindStatus.Normal);
+        } else if (own.status === MultiChainRewindStatus.Complete) {
+          await this.setStatus(MultiChainRewindStatus.Complete);
+        } else {
+          await this.setStatus(MultiChainRewindStatus.Incomplete, own.rewindTimestamp);
+        }
+      } catch (e: any) {
+        // A failed read is retried on the next loop iteration; a rejection here would poison the chain for good
+        logger.warn(`Failed to sync rewind status from database, chainId: ${this.chainId}: ${e.message}`);
+      }
+    });
+    await this.processingPromise;
   }
 
   private async searchWaitRewindHeader(rewindTimestamp: Date): Promise<Header> {
@@ -231,7 +317,10 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     if (status === MultiChainRewindStatus.Incomplete) {
       assert(rewindTimestamp, 'rewindTimestamp is not set');
       this.status = MultiChainRewindStatus.Incomplete;
-      this.waitRewindHeader = await this.searchWaitRewindHeader(rewindTimestamp);
+      // The header is a function of the timestamp, so a repeated notification for the same target needs no new search
+      if (this.waitRewindHeader?.timestamp.getTime() !== rewindTimestamp.getTime()) {
+        this.waitRewindHeader = await this.searchWaitRewindHeader(rewindTimestamp);
+      }
     } else {
       this.status = status;
       this.waitRewindHeader = undefined;

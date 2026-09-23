@@ -223,6 +223,14 @@ export class WorkerBlockDispatcher<
     this.processQueue.flush();
   }
 
+  protected isIdle(): boolean {
+    return !this.queue.size && !this.processQueue.size;
+  }
+
+  protected async enqueueProcessTask(task: () => Promise<void>): Promise<void> {
+    await this.processQueue.put(task);
+  }
+
   @Interval(15000)
   async sampleWorkerStatus(): Promise<void> {
     const statuses = await Promise.all(this.workers.map((worker) => worker.getStatus()));

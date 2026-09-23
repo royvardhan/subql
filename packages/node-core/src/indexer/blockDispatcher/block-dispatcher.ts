@@ -108,6 +108,14 @@ export class BlockDispatcher<B, DS extends BaseDataSource>
     this.processQueue.flush();
   }
 
+  protected isIdle(): boolean {
+    return !this.queue.size && !this.fetchQueue.size && !this.processQueue.size;
+  }
+
+  protected async enqueueProcessTask(task: () => Promise<void>): Promise<void> {
+    await this.processQueue.put(task);
+  }
+
   @Interval(10000)
   queueStats(stat: 'size' | 'freeSpace' = 'freeSpace'): void {
     // NOTE: If the free space of the process queue is low it means that processing is the limiting factor. If it is large then fetching blocks is the limitng factor.

@@ -12,6 +12,8 @@ import {GlobalData, GlobalDataRepo, MultiChainRewindStatus} from '../../entities
 export interface IGlobalData {
   getChainRewindInfo(): Promise<GlobalData | null>;
 
+  listChains(): Promise<GlobalData[]>;
+
   acquireGlobalRewindLock(rewindTimestamp: Date): Promise<{lockTimestamp: Date}>;
   /**
    * Check if the height is consistent before unlocking.
@@ -24,6 +26,8 @@ export interface IGlobalData {
 }
 
 const logger = getLogger('PlainGlobalModel');
+
+export const MULTICHAIN_REWIND_LOCK_KEY = 'multiChainRewindLock';
 
 export class PlainGlobalModel implements IGlobalData {
   constructor(
@@ -48,6 +52,10 @@ export class PlainGlobalModel implements IGlobalData {
     });
 
     return rewindTimestampInfo;
+  }
+
+  async listChains(): Promise<GlobalData[]> {
+    return this.model.findAll();
   }
 
   /**
@@ -173,6 +181,13 @@ export class PlainGlobalModel implements IGlobalData {
     return {currentChain, chainsCount: chainList.length, waitChainCount};
   }
 
+  /**
+   * The chains that take part in a rewind. A chain is enrolled only when its node registered itself with the
+   * `multiChainRewindLock` metadata key: a node on an image without the lock, one started with
+   * `--disable-multichain-rewind-lock`, or a metadata table left behind by a removed chain can never release its
+   * entry, and enrolling it would hold every other chain in the "waiting for other chains" state forever.
+   * The current chain is always enrolled since it is the one acquiring the lock.
+   */
   async getChainIdsFromMetadata(tx: Transaction): Promise<string[]> {
     const tableRes = await this.sequelize.query<Array<string>>(tableExistsQuery(this.dbSchema), {
       type: QueryTypes.SELECT,
@@ -185,8 +200,8 @@ export class PlainGlobalModel implements IGlobalData {
 
     const metadataRes = await Promise.all(
       multiMetadataTables.map((table) =>
-        this.sequelize.query<{value: string}>(
-          `SELECT "value" FROM "${this.dbSchema}"."${table}" WHERE "key" = 'chain'`,
+        this.sequelize.query<{key: string; value: unknown}>(
+          `SELECT "key", "value" FROM "${this.dbSchema}"."${table}" WHERE "key" IN ('chain', '${MULTICHAIN_REWIND_LOCK_KEY}')`,
           {
             type: QueryTypes.SELECT,
             transaction: tx,
@@ -195,6 +210,26 @@ export class PlainGlobalModel implements IGlobalData {
       )
     );
 
-    return metadataRes.map((metadata) => metadata[0].value);
+    const enrolled: string[] = [];
+    const excluded: string[] = [];
+    for (const rows of metadataRes) {
+      const chainId = rows.find((row) => row.key === 'chain')?.value;
+      if (typeof chainId !== 'string') continue;
+      const participates = rows.find((row) => row.key === MULTICHAIN_REWIND_LOCK_KEY)?.value === true;
+      if (participates || chainId === this.chainId) {
+        enrolled.push(chainId);
+      } else {
+        excluded.push(chainId);
+      }
+    }
+
+    if (excluded.length) {
+      logger.warn(
+        `Chains not enrolled in the rewind because their node has not registered for the multichain rewind lock: ${excluded.join(', ')}`
+      );
+    }
+    assert(enrolled.includes(this.chainId), `Not found chainId: ${this.chainId} in multi metadata tables`);
+
+    return enrolled;
   }
 }

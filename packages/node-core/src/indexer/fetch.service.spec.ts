@@ -123,7 +123,7 @@ class TestBlockchainService implements IBlockchainService {
   getSafeApi(block: any): Promise<any> {
     throw new Error('Method not implemented.');
   }
-  // eslint-disable-next-line @typescript-eslint/promise-function-async
+
   onProjectChange(project: ISubqueryProject): Promise<void> | void {
     throw new Error('Method not implemented.');
   }
@@ -211,7 +211,8 @@ const getBlockDispatcher = () => {
     flushQueue: (height: number) => {
       /* TODO */
     },
-  } as BlockDispatcher<any, any>;
+    rewindIfIdle: jest.fn(() => Promise.resolve(true)),
+  } as unknown as BlockDispatcher<any, any>;
 
   return inst;
 };
@@ -231,7 +232,12 @@ describe('Fetch Service', () => {
   let dataSources: BaseDataSource[];
   let unfinalizedBlocksService: UnfinalizedBlocksService<any>;
   let blockchainService: TestBlockchainService;
-  const multichainRewindService: MultiChainRewindService = {} as MultiChainRewindService;
+  const multichainRewindService = {
+    status: MultiChainRewindStatus.Normal,
+    waitingFor: ['other-chain'],
+    waitRewindHeader: undefined as Header | undefined,
+    syncStatusFromDb: jest.fn(() => Promise.resolve()),
+  } as unknown as MultiChainRewindService & {status: MultiChainRewindStatus; waitRewindHeader?: Header};
   let projectService: IProjectService<any>;
 
   let spyOnEnqueueSequential: jest.SpyInstance<
@@ -245,6 +251,9 @@ describe('Fetch Service', () => {
 
   beforeEach(() => {
     dataSources = [mockDs];
+    multichainRewindService.status = MultiChainRewindStatus.Normal;
+    multichainRewindService.waitRewindHeader = undefined;
+    (multichainRewindService.syncStatusFromDb as jest.Mock).mockClear();
 
     const eventEmitter = new EventEmitter2();
     const schedulerRegistry = new SchedulerRegistry();
@@ -818,13 +827,33 @@ describe('Fetch Service', () => {
     expect((fetchService as any).blockDispatcher.latestBufferedHeight).toEqual(910);
   }, 10000);
 
+  const waitFor = async (condition: () => boolean): Promise<void> =>
+    new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        clearInterval(intervalId);
+        reject(new Error('Timed out waiting for fetch loop iteration'));
+      }, 1000);
+      const intervalId = setInterval(() => {
+        if (condition()) {
+          clearTimeout(timeoutId);
+          clearInterval(intervalId);
+          resolve();
+        }
+      }, 10);
+    });
+
   it('MultiChainRewindStatus.Complete message', async () => {
     const logger = getLogger('FetchService');
     const consoleSpy = jest.spyOn(logger, 'info');
 
-    (multichainRewindService as any).status = MultiChainRewindStatus.Complete;
+    multichainRewindService.status = MultiChainRewindStatus.Complete;
     await fetchService.init(10);
-    expect(consoleSpy).toHaveBeenCalledWith(expect.stringMatching(/Waiting for all chains to complete rewind/));
+    await waitFor(() => consoleSpy.mock.calls.length > 0);
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/Waiting for all chains to complete rewind.*waiting for: other-chain/)
+    );
+    expect(multichainRewindService.syncStatusFromDb).toHaveBeenCalled();
+    expect(enqueueBlocksSpy).not.toHaveBeenCalled();
   });
 
   it('does not wait for multichain rewind when lock is disabled', async () => {
@@ -832,21 +861,37 @@ describe('Fetch Service', () => {
     const consoleSpy = jest.spyOn(logger, 'info');
 
     nodeConfig.merge({disableMultichainRewindLock: true});
-    (multichainRewindService as any).status = MultiChainRewindStatus.Complete;
+    multichainRewindService.status = MultiChainRewindStatus.Complete;
     await fetchService.init(10);
-    await new Promise<void>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        clearInterval(intervalId);
-        reject(new Error('Timed out waiting for fetch loop iteration'));
-      }, 1000);
-      const intervalId = setInterval(() => {
-        if (enqueueBlocksSpy.mock.calls.length > 0) {
-          clearTimeout(timeoutId);
-          clearInterval(intervalId);
-          resolve();
-        }
-      }, 10);
-    });
+    await waitFor(() => enqueueBlocksSpy.mock.calls.length > 0);
     expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringMatching(/Waiting for all chains to complete rewind/));
+  });
+
+  it('runs a pending multichain rewind when there are no new blocks to process', async () => {
+    const header: Header = {blockHeight: 5, blockHash: '0x5', parentHash: '0x4', timestamp: new Date()};
+    multichainRewindService.status = MultiChainRewindStatus.Incomplete;
+    multichainRewindService.waitRewindHeader = header;
+    // Already indexed past the chain head, so no block will be processed to trigger the rewind
+    blockchainService.finalizedHeight = 9;
+    blockchainService.bestHeight = 9;
+
+    await fetchService.init(10);
+    await waitFor(() => (blockDispatcher.rewindIfIdle as jest.Mock).mock.calls.length > 0);
+    expect(blockDispatcher.rewindIfIdle).toHaveBeenCalledWith(header);
+    expect(enqueueBlocksSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not run an idle rewind while blocks are still being indexed', async () => {
+    multichainRewindService.status = MultiChainRewindStatus.Incomplete;
+    multichainRewindService.waitRewindHeader = {
+      blockHeight: 5,
+      blockHash: '0x5',
+      parentHash: '0x4',
+      timestamp: new Date(),
+    };
+
+    await fetchService.init(10);
+    await waitFor(() => enqueueBlocksSpy.mock.calls.length > 0);
+    expect(blockDispatcher.rewindIfIdle).not.toHaveBeenCalled();
   });
 });

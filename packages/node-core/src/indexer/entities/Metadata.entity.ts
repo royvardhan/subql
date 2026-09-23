@@ -24,6 +24,8 @@ export interface MetadataKeys {
   specName: string;
   lastFinalizedVerifiedHeight: number;
   indexerHealthy: boolean;
+  // Written at startup by nodes that take part in the multichain rewind lock; only these are enrolled in a rewind
+  multiChainRewindLock: boolean;
   targetHeight: number;
   dynamicDatasources: DatasourceParams[];
   unfinalizedBlocks: string;

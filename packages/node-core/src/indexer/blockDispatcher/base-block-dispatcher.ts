@@ -39,6 +39,8 @@ export interface IBlockDispatcher<B> {
   setLatestProcessedHeight(height: number): void;
   // Remove all enqueued blocks, used when a dynamic ds is created
   flushQueue(height: number): void;
+  // Run a pending multichain rewind when no blocks are queued or being processed; returns whether it ran
+  rewindIfIdle(header: Header): Promise<boolean>;
 }
 
 const NULL_MERKEL_ROOT = hexToU8a('0x00');
@@ -54,6 +56,7 @@ export abstract class BaseBlockDispatcher<Q extends IQueue, DS, B> implements IB
   protected currentProcessingHeight = 0;
   private _onDynamicDsCreated?: (height: number) => void;
   private _pendingRewindHeader?: Header;
+  private idleRewindInProgress = false;
 
   protected isShutdown = false;
 
@@ -75,6 +78,12 @@ export abstract class BaseBlockDispatcher<Q extends IQueue, DS, B> implements IB
   ) {}
 
   abstract enqueueBlocks(heights: (IBlock<B> | number)[], latestBufferHeight?: number): void | Promise<void>;
+
+  // Whether no block is queued, being fetched or being processed
+  protected abstract isIdle(): boolean;
+
+  // Run a task on the queue that processes blocks so it cannot overlap with block processing
+  protected abstract enqueueProcessTask(task: () => Promise<void>): Promise<void>;
 
   async init(onDynamicDsCreated: (height: number) => void): Promise<void> {
     this._onDynamicDsCreated = onDynamicDsCreated;
@@ -154,6 +163,56 @@ export abstract class BaseBlockDispatcher<Q extends IQueue, DS, B> implements IB
     this.queue.flush();
   }
 
+  /**
+   * A multichain rewind is otherwise only run from postProcessBlock, so a chain with no new blocks would hold the
+   * rewind lock until it is restarted. The target comes from a binary search bounded by the last processed height,
+   * so reindex() itself decides whether anything has to be rolled back before releasing the lock.
+   */
+  @mainThreadOnly()
+  async rewindIfIdle(header: Header): Promise<boolean> {
+    if (this.isShutdown || this.idleRewindInProgress || !this.isIdle()) return false;
+    this.idleRewindInProgress = true;
+    try {
+      await this.enqueueProcessTask(async () => {
+        // Re-read in case a block processed in the meantime already ran the rewind
+        const pending = this.multiChainRewindService.waitRewindHeader;
+        if (!pending) return;
+        logger.info(`No blocks to process, rewinding to block ${pending.blockHeight} for multichain rewind...`);
+        await this.runRewind(pending, async () => {
+          await this.projectService.reindex(pending);
+          this.setLatestProcessedHeight(pending.blockHeight);
+          this.flushQueue(pending.blockHeight);
+        });
+      });
+      return true;
+    } catch (e: any) {
+      // Flushing the queue from inside the task rejects the task itself once it has completed
+      if (isTaskFlushedError(e)) return true;
+      this.eventEmitter.emit(IndexerEvent.RewindFailure, {success: false, message: e.message});
+      monitorWrite(`***** Rewind failed: ${e.message}`);
+      throw e;
+    } finally {
+      this.idleRewindInProgress = false;
+    }
+  }
+
+  // Pause POI syncing around a rewind and report the outcome
+  private async runRewind(header: Header, rewind: () => Promise<void>): Promise<void> {
+    if (this.nodeConfig.proofOfIndex) {
+      await this.poiSyncService.stopSync();
+      this.poiSyncService.clear();
+      monitorWrite(`poiSyncService stopped, cache cleared`);
+    }
+    monitorCreateBlockFork(header.blockHeight);
+    this.resetPendingRewindHeader();
+    await rewind();
+    // Bring poi sync service back to sync again.
+    if (this.nodeConfig.proofOfIndex) {
+      void this.poiSyncService.syncPoi();
+    }
+    this.eventEmitter.emit(IndexerEvent.RewindSuccess, {success: true, height: header.blockHeight});
+  }
+
   // Is called directly before a block is processed
   @mainThreadOnly()
   protected async preProcessBlock(header: Header): Promise<void> {
@@ -188,19 +247,7 @@ export abstract class BaseBlockDispatcher<Q extends IQueue, DS, B> implements IB
           this.storeService.transaction
         );
 
-        if (this.nodeConfig.proofOfIndex) {
-          await this.poiSyncService.stopSync();
-          this.poiSyncService.clear();
-          monitorWrite(`poiSyncService stopped, cache cleared`);
-        }
-        monitorCreateBlockFork(reindexBlockHeader.blockHeight);
-        this.resetPendingRewindHeader();
-        await this.rewind(reindexBlockHeader);
-        // Bring poi sync service back to sync again.
-        if (this.nodeConfig.proofOfIndex) {
-          void this.poiSyncService.syncPoi();
-        }
-        this.eventEmitter.emit(IndexerEvent.RewindSuccess, {success: true, height: reindexBlockHeader.blockHeight});
+        await this.runRewind(reindexBlockHeader, () => this.rewind(reindexBlockHeader));
         return;
       } catch (e: any) {
         this.eventEmitter.emit(IndexerEvent.RewindFailure, {success: false, message: e.message});
