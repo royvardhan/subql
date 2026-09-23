@@ -236,7 +236,6 @@ describe('Fetch Service', () => {
     status: MultiChainRewindStatus.Normal,
     waitingFor: ['other-chain'],
     waitRewindHeader: undefined as Header | undefined,
-    syncStatusFromDb: jest.fn(() => Promise.resolve()),
   } as unknown as MultiChainRewindService & {status: MultiChainRewindStatus; waitRewindHeader?: Header};
   let projectService: IProjectService<any>;
 
@@ -253,7 +252,6 @@ describe('Fetch Service', () => {
     dataSources = [mockDs];
     multichainRewindService.status = MultiChainRewindStatus.Normal;
     multichainRewindService.waitRewindHeader = undefined;
-    (multichainRewindService.syncStatusFromDb as jest.Mock).mockClear();
 
     const eventEmitter = new EventEmitter2();
     const schedulerRegistry = new SchedulerRegistry();
@@ -852,7 +850,6 @@ describe('Fetch Service', () => {
     expect(consoleSpy).toHaveBeenCalledWith(
       expect.stringMatching(/Waiting for all chains to complete rewind.*waiting for: other-chain/)
     );
-    expect(multichainRewindService.syncStatusFromDb).toHaveBeenCalled();
     expect(enqueueBlocksSpy).not.toHaveBeenCalled();
   });
 

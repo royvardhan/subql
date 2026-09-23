@@ -168,6 +168,7 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
   async fillNextBlockBuffer(initBlockHeight: number): Promise<void> {
     let startBlockHeight: number;
     let scaledBatchSize: number;
+    let rewindWaitTicks = 0;
 
     const getStartBlockHeight = (): number => {
       return this.blockDispatcher.latestBufferedHeight
@@ -182,9 +183,6 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
 
       const latestHeight = this.latestHeight();
 
-      // Refresh the in-memory status from the lock table (throttled, in the background) rather than trusting only
-      // notifications, so a missed one cannot leave this chain rewinding late or waiting forever.
-      void this.multiChainRewindService.syncStatusFromDb();
       const multiChainStatus = this.multiChainRewindService.status;
 
       if (this.blockDispatcher.freeSize < scaledBatchSize || startBlockHeight > latestHeight) {
@@ -212,12 +210,15 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
 
       // If we're rewinding, we should wait until it's done
       if (!this.nodeConfig.disableMultichainRewindLock && MultiChainRewindStatus.Complete === multiChainStatus) {
-        logger.info(
-          `Waiting for all chains to complete rewind, current chainId: ${this.multiChainRewindService.chainId}, waiting for: ${this.multiChainRewindService.waitingFor.join(', ')}`
-        );
+        if (rewindWaitTicks++ % 10 === 0) {
+          logger.info(
+            `Waiting for all chains to complete rewind, current chainId: ${this.multiChainRewindService.chainId}, waiting for: ${this.multiChainRewindService.waitingFor.join(', ')}`
+          );
+        }
         await delay(multiChainRewindDelay);
         continue;
       }
+      rewindWaitTicks = 0;
 
       // This could be latestBestHeight, dictionary should never include finalized blocks
       // TODO add buffer so dictionary not used when project synced

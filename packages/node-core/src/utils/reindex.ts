@@ -64,8 +64,13 @@ export async function reindex(
     );
     if (storeService.isMultichain) {
       const tx = await sequelize.transaction();
-      await multichainRewindService.releaseChainRewindLock(tx, new Date(targetUnit), new Date(lastUnit || 0));
-      await tx.commit();
+      try {
+        await multichainRewindService.releaseChainRewindLock(tx, new Date(targetUnit), new Date(lastUnit || 0));
+        await tx.commit();
+      } catch (e) {
+        await tx.rollback();
+        throw e;
+      }
     }
     return;
   }

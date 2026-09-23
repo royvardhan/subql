@@ -414,7 +414,7 @@ describe('MultiChain Rewind Service', () => {
     });
   });
 
-  describe('syncStatusFromDb', () => {
+  describe('reconcile', () => {
     // Detach the notification handler so only the table read can change the status
     const muteNotifications = (service: MultiChainRewindService) =>
       (service as any).pgListener.removeAllListeners('notification');
@@ -426,7 +426,7 @@ describe('MultiChain Rewind Service', () => {
       await delay(notifyHandleDelay);
       expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Normal);
 
-      await multiChainRewindService2.syncStatusFromDb(true);
+      await multiChainRewindService2.reconcile();
       expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
       expect(multiChainRewindService2.waitRewindHeader).toEqual({
         blockHash: 'hash5',
@@ -446,7 +446,7 @@ describe('MultiChain Rewind Service', () => {
       await tx.commit();
       expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Complete);
 
-      await multiChainRewindService1.syncStatusFromDb(true);
+      await multiChainRewindService1.reconcile();
       expect(multiChainRewindService1.waitingFor).toEqual([chainId2]);
 
       tx = await sequelize2.transaction();
@@ -455,20 +455,22 @@ describe('MultiChain Rewind Service', () => {
       await delay(notifyHandleDelay);
       expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Complete);
 
-      await multiChainRewindService1.syncStatusFromDb(true);
+      await multiChainRewindService1.reconcile();
       expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Normal);
       expect(multiChainRewindService1.waitingFor).toEqual([]);
     });
 
-    it('throttles reads of the lock table unless forced', async () => {
-      const listChains = jest.spyOn(multiChainRewindService1.globalModel, 'listChains');
-      await multiChainRewindService1.syncStatusFromDb(true);
-      expect(listChains).toHaveBeenCalledTimes(1);
-      await multiChainRewindService1.syncStatusFromDb();
-      await multiChainRewindService1.syncStatusFromDb();
-      expect(listChains).toHaveBeenCalledTimes(1);
-      await multiChainRewindService1.syncStatusFromDb(true);
-      expect(listChains).toHaveBeenCalledTimes(2);
+    it('polls the lock table on an interval', async () => {
+      muteNotifications(multiChainRewindService2);
+      clearInterval((multiChainRewindService2 as any).pollTimer);
+      (multiChainRewindService2 as any).pollTimer = setInterval(
+        () => void multiChainRewindService2.reconcile('poll'),
+        100
+      );
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
     });
 
     it('does not search for a header again when the rewind timestamp is unchanged', async () => {
@@ -479,18 +481,98 @@ describe('MultiChain Rewind Service', () => {
       expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
       expect(search).toHaveBeenCalledTimes(1);
 
-      await multiChainRewindService2.syncStatusFromDb(true);
+      await multiChainRewindService2.reconcile();
       expect(search).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a completed status while its own release is not yet committed', async () => {
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Incomplete);
+
+      const tx = await sequelize1.transaction();
+      await multiChainRewindService1.releaseChainRewindLock(tx, rewindDate);
+      // The row still reads incomplete outside the transaction
+      await multiChainRewindService1.reconcile();
+      expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Complete);
+      expect(multiChainRewindService1.waitRewindHeader).toBeUndefined();
+      await tx.commit();
+
+      // An earlier lock taken by another chain is not mistaken for the uncommitted release
+      const {rewindDate: earlierDate} = genBlockTimestamp(3);
+      muteNotifications(multiChainRewindService1);
+      await multiChainRewindService2.acquireGlobalRewindLock(earlierDate);
+      await multiChainRewindService1.reconcile();
+      expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Incomplete);
+      expect(multiChainRewindService1.waitRewindHeader?.timestamp).toEqual(earlierDate);
+    });
+
+    it('keeps a pending rewind when the lock table was cleared by hand', async () => {
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
+
+      muteNotifications(multiChainRewindService2);
+      await sequelize.query(`DELETE FROM "${testSchemaName}"."_global";`);
+      await multiChainRewindService2.reconcile();
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
+      expect(multiChainRewindService2.waitRewindHeader?.blockHeight).toBe(5);
+    });
+
+    it('a failed header search does not block later notifications', async () => {
+      mockBlockchainService.getHeaderForHeight.mockImplementationOnce(() => {
+        throw new Error('rpc unavailable');
+      });
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      const failed = [multiChainRewindService1, multiChainRewindService2].filter(
+        (service) => service.waitRewindHeader === undefined
+      );
+      expect(failed).toHaveLength(1);
+
+      // The next reconcile retries the search
+      await failed[0].reconcile();
+      expect(failed[0].waitRewindHeader?.blockHeight).toBe(5);
+
+      let tx = await sequelize1.transaction();
+      await multiChainRewindService1.releaseChainRewindLock(tx, rewindDate);
+      await tx.commit();
+      tx = await sequelize2.transaction();
+      await multiChainRewindService2.releaseChainRewindLock(tx, rewindDate);
+      await tx.commit();
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Normal);
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Normal);
     });
   });
 
   describe('listener recovery', () => {
-    it('re-registers the listener after the connection is lost and re-reads the lock table', async () => {
-      const lostListener = (multiChainRewindService2 as any).pgListener;
-      lostListener.emit('error', new Error('connection reset'));
+    const listenerOf = (service: MultiChainRewindService) => (service as any).pgListener;
+
+    it('re-registers the listener after the server terminates the connection', async () => {
+      const lostListener = listenerOf(multiChainRewindService2);
+      const [{pid}] = (await lostListener.query('SELECT pg_backend_pid() AS pid')).rows;
+      await sequelize.query(`SELECT pg_terminate_backend(${pid});`);
+      await delay(1);
+      expect(listenerOf(multiChainRewindService2)).toBeDefined();
+      expect(listenerOf(multiChainRewindService2)).not.toBe(lostListener);
+
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
       await delay(notifyHandleDelay);
-      expect((multiChainRewindService2 as any).pgListener).toBeDefined();
-      expect((multiChainRewindService2 as any).pgListener).not.toBe(lostListener);
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
+    });
+
+    it('replaces a listener whose heartbeat hangs', async () => {
+      const lostListener = listenerOf(multiChainRewindService2);
+      jest.spyOn(lostListener, 'query').mockImplementation(() => new Promise(() => undefined));
+      multiChainRewindService2.heartbeatTimeoutSec = 0.2;
+      await (multiChainRewindService2 as any).heartbeat();
+      expect(listenerOf(multiChainRewindService2)).toBeDefined();
+      expect(listenerOf(multiChainRewindService2)).not.toBe(lostListener);
 
       const {rewindDate} = genBlockTimestamp(5);
       await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
