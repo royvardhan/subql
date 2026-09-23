@@ -521,6 +521,46 @@ describe('MultiChain Rewind Service', () => {
       expect(multiChainRewindService2.waitRewindHeader?.blockHeight).toBe(5);
     });
 
+    it('picks up a new lock at the timestamp it already completed', async () => {
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      const tx = await sequelize1.transaction();
+      await multiChainRewindService1.releaseChainRewindLock(tx, rewindDate);
+      await tx.commit();
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Complete);
+
+      // The lock table is cleared by hand and the chain still pending takes the lock again at the same timestamp
+      muteNotifications(multiChainRewindService1);
+      await sequelize.query(`DELETE FROM "${testSchemaName}"."_global";`);
+      await multiChainRewindService2.acquireGlobalRewindLock(rewindDate);
+      await multiChainRewindService1.reconcile();
+      expect(multiChainRewindService1.status).toBe(MultiChainRewindStatus.Incomplete);
+      expect(multiChainRewindService1.waitRewindHeader?.timestamp).toEqual(rewindDate);
+    });
+
+    it('drops the previous target when the search for an earlier one fails', async () => {
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService2.waitRewindHeader?.blockHeight).toBe(5);
+
+      muteNotifications(multiChainRewindService1);
+      muteNotifications(multiChainRewindService2);
+      const {rewindDate: earlierDate} = genBlockTimestamp(3);
+      await multiChainRewindService1.acquireGlobalRewindLock(earlierDate);
+      mockBlockchainService.getHeaderForHeight.mockImplementationOnce(() => {
+        throw new Error('rpc unavailable');
+      });
+      await multiChainRewindService2.reconcile();
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
+      expect(multiChainRewindService2.waitRewindHeader).toBeUndefined();
+
+      await multiChainRewindService2.reconcile();
+      expect(multiChainRewindService2.waitRewindHeader?.blockHeight).toBe(3);
+    });
+
     it('a failed header search does not block later notifications', async () => {
       mockBlockchainService.getHeaderForHeight.mockImplementationOnce(() => {
         throw new Error('rpc unavailable');
@@ -574,6 +614,32 @@ describe('MultiChain Rewind Service', () => {
       expect(listenerOf(multiChainRewindService2)).toBeDefined();
       expect(listenerOf(multiChainRewindService2)).not.toBe(lostListener);
 
+      const {rewindDate} = genBlockTimestamp(5);
+      await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
+      await delay(notifyHandleDelay);
+      expect(multiChainRewindService2.status).toBe(MultiChainRewindStatus.Incomplete);
+    });
+
+    it('does not keep a new connection whose LISTEN failed', async () => {
+      const connectionManager = sequelize2.connectionManager as any;
+      const getConnection = connectionManager.getConnection.bind(connectionManager);
+      let failedListener: any;
+      jest.spyOn(connectionManager, 'getConnection').mockImplementationOnce(async (options: any) => {
+        failedListener = await getConnection(options);
+        jest.spyOn(failedListener, 'query').mockImplementationOnce(() => Promise.reject(new Error('listen failed')));
+        return failedListener;
+      });
+
+      const lostListener = listenerOf(multiChainRewindService2);
+      jest.spyOn(lostListener, 'query').mockImplementation(() => new Promise(() => undefined));
+      multiChainRewindService2.heartbeatTimeoutSec = 0.2;
+      await (multiChainRewindService2 as any).heartbeat();
+      expect(failedListener).toBeDefined();
+      expect(listenerOf(multiChainRewindService2)).toBeDefined();
+      expect(listenerOf(multiChainRewindService2)).not.toBe(lostListener);
+      expect(listenerOf(multiChainRewindService2)).not.toBe(failedListener);
+
+      // Only a notification can change the status here, the poll interval is far longer than the test
       const {rewindDate} = genBlockTimestamp(5);
       await multiChainRewindService1.acquireGlobalRewindLock(rewindDate);
       await delay(notifyHandleDelay);

@@ -172,11 +172,13 @@ export abstract class BaseBlockDispatcher<Q extends IQueue, DS, B> implements IB
   async rewindIfIdle(header: Header): Promise<boolean> {
     if (this.isShutdown || this.idleRewindInProgress || !this.isIdle()) return false;
     this.idleRewindInProgress = true;
+    let ran = false;
     try {
       await this.enqueueProcessTask(async () => {
         // Re-read in case a block processed in the meantime already ran the rewind
         const pending = this.multiChainRewindService.waitRewindHeader;
         if (!pending) return;
+        ran = true;
         logger.info(`No blocks to process, rewinding to block ${pending.blockHeight} for multichain rewind...`);
         await this.runRewind(pending, async () => {
           await this.projectService.reindex(pending);
@@ -184,10 +186,10 @@ export abstract class BaseBlockDispatcher<Q extends IQueue, DS, B> implements IB
           this.flushQueue(pending.blockHeight);
         });
       });
-      return true;
+      return ran;
     } catch (e: any) {
       // Flushing the queue from inside the task rejects the task itself once it has completed
-      if (isTaskFlushedError(e)) return true;
+      if (isTaskFlushedError(e)) return ran;
       this.eventEmitter.emit(IndexerEvent.RewindFailure, {success: false, message: e.message});
       monitorWrite(`***** Rewind failed: ${e.message}`);
       throw e;

@@ -184,8 +184,10 @@ export class PlainGlobalModel implements IGlobalData {
   /**
    * The chains that take part in a rewind. A chain is enrolled only when its node registered itself with the
    * `multiChainRewindLock` metadata key: a node on an image without the lock, one started with
-   * `--disable-multichain-rewind-lock`, or a metadata table left behind by a removed chain can never release its
-   * entry, and enrolling it would hold every other chain in the "waiting for other chains" state forever.
+   * `--disable-multichain-rewind-lock`, or a metadata table left behind by a chain removed before this key existed
+   * can never release its entry, and enrolling it would hold every other chain in the "waiting for other chains"
+   * state forever. The key is not cleared when a node stops, so a stopped node stays enrolled and must be restarted
+   * to release the lock; to retire a chain, set its `multiChainRewindLock` metadata value to false.
    * The current chain is always enrolled since it is the one acquiring the lock.
    */
   async getChainIdsFromMetadata(tx: Transaction): Promise<string[]> {

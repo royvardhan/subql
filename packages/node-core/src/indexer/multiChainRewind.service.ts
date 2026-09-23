@@ -49,8 +49,9 @@ export class MultiChainRewindService implements OnApplicationShutdown {
   private processingPromise: Promise<void> = Promise.resolve();
   private enabled = false;
   private _waitingFor: string[] = [];
-  // Timestamp of the rewind this chain last released, to tell an uncommitted release apart from a new, earlier lock
-  private lastCompletedRewindTimestamp?: Date;
+  // Timestamp of this chain's release of the lock until its transaction commits, to tell it apart from a new lock.
+  // A rolled back release is not cleared, but every caller rethrows and the indexer exits.
+  private pendingReleaseTimestamp?: Date;
   private pollTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
   private reconnecting = false;
@@ -170,14 +171,34 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     const listener = (await this.sequelize.connectionManager.getConnection({
       type: 'read',
     })) as PoolClient;
-    this.pgListener = listener;
 
     listener.on('notification', this.notifyHandle.bind(this));
     listener.on('error', (e) => void this.reconnectListener(listener, e));
     listener.on('end', () => void this.reconnectListener(listener, new Error('connection ended')));
 
-    await listener.query(`LISTEN "${this.rewindTriggerName}"`);
+    try {
+      await listener.query(`LISTEN "${this.rewindTriggerName}"`);
+    } catch (e) {
+      // Only a connection that is listening may become the listener, otherwise a retry would keep it as is
+      await this.destroyListenerConnection(listener);
+      throw e;
+    }
+    this.pgListener = listener;
     logger.info(`Register rewind listener success, chainId: ${this.chainId}`);
+  }
+
+  private async destroyListenerConnection(listener: PoolClient): Promise<void> {
+    listener.removeAllListeners('notification');
+    try {
+      // Ending a half-open socket can block on the dead write until the TCP retries give up, so don't wait for it
+      await timeout(
+        this.sequelize.connectionManager.destroyConnection(listener as Connection),
+        this.heartbeatTimeoutSec,
+        'destroy timed out'
+      );
+    } catch (destroyErr: any) {
+      logger.debug(`Failed to destroy rewind listener connection: ${destroyErr.message}`);
+    }
   }
 
   /**
@@ -203,16 +224,7 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     this.reconnecting = true;
     logger.warn(`Rewind listener connection lost, chainId: ${this.chainId}: ${e.message}`);
     this.pgListener = undefined;
-    try {
-      // Ending a half-open socket can block on the dead write until the TCP retries give up, so don't wait for it
-      await timeout(
-        this.sequelize.connectionManager.destroyConnection(listener as Connection),
-        this.heartbeatTimeoutSec,
-        'destroy timed out'
-      );
-    } catch (destroyErr: any) {
-      logger.debug(`Failed to destroy rewind listener connection: ${destroyErr.message}`);
-    }
+    await this.destroyListenerConnection(listener);
 
     try {
       for (let attempt = 1; !this._shutdown; attempt++) {
@@ -277,10 +289,11 @@ export class MultiChainRewindService implements OnApplicationShutdown {
         await this.setStatus(MultiChainRewindStatus.Complete);
       } else {
         const rewindTimestamp = own.rewindTimestamp;
-        // Our own release is not committed yet, so the row still reads incomplete at the timestamp we just rewound to
+        // Our own release is not committed yet, so the row still reads incomplete at the timestamp we just rewound to.
+        // Once that transaction has finished, an incomplete row is a new lock, even at the same timestamp.
         if (
           before === MultiChainRewindStatus.Complete &&
-          this.lastCompletedRewindTimestamp?.getTime() === rewindTimestamp.getTime()
+          this.pendingReleaseTimestamp?.getTime() === rewindTimestamp.getTime()
         ) {
           return;
         }
@@ -337,7 +350,10 @@ export class MultiChainRewindService implements OnApplicationShutdown {
     const chainsCount = await this.globalModel.releaseChainRewindLock(tx, rewindTimestamp, allowRewindTimestamp);
     // The current chain has completed the rewind, and we still need to wait for other chains to finish.
     // When fully synchronized, set the status back to normal by pgListener.
-    this.lastCompletedRewindTimestamp = rewindTimestamp;
+    this.pendingReleaseTimestamp = rewindTimestamp;
+    tx.afterCommit(() => {
+      if (this.pendingReleaseTimestamp === rewindTimestamp) this.pendingReleaseTimestamp = undefined;
+    });
     await this.setStatus(MultiChainRewindStatus.Complete);
     logger.info(`Rewind success chainId: ${JSON.stringify({chainsCount, chainId: this.chainId, rewindTimestamp})}`);
     return chainsCount;
@@ -349,14 +365,13 @@ export class MultiChainRewindService implements OnApplicationShutdown {
       this.status = MultiChainRewindStatus.Incomplete;
       // The header is a function of the timestamp, so a repeated notification for the same target needs no new search
       if (this.waitRewindHeader?.timestamp.getTime() !== rewindTimestamp.getTime()) {
+        // Drop the old target first so a failed search can't leave the chain rewinding to it
+        this.waitRewindHeader = undefined;
         this.waitRewindHeader = await this.searchWaitRewindHeader(rewindTimestamp);
       }
     } else {
       this.status = status;
       this.waitRewindHeader = undefined;
-      if (status === MultiChainRewindStatus.Normal) {
-        this.lastCompletedRewindTimestamp = undefined;
-      }
     }
   }
 

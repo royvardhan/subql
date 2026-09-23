@@ -88,7 +88,6 @@ export class AutoQueue<T> implements IQueue {
     return this.putMany([item])[0];
   }
 
-  // eslint-disable-next-line @typescript-eslint/promise-function-async
   putMany(tasks: Array<Task<T>>): Promise<T>[] {
     if (this.freeSpace && tasks.length > this.freeSpace) {
       throw new Error(`${this.name} Queue exceeds max size of ${this.capacity}`);
@@ -117,10 +116,11 @@ export class AutoQueue<T> implements IQueue {
       // Loop as long as the next task in sequence is present in the outOfOrderTasks map
       let record = this.outOfOrderTasks[this.nextTask];
       while (record !== undefined) {
-        if (record.error !== undefined) {
+        // Tasks that return nothing must resolve too, or callers awaiting them hang
+        if ('error' in record) {
           record.action.reject(record.error);
-        } else if (record.result !== undefined) {
-          record.action.resolve(record.result);
+        } else {
+          record.action.resolve(record.result as T);
         }
 
         delete this.outOfOrderTasks[this.nextTask];

@@ -26,6 +26,22 @@ describe('AutoQueue', () => {
     expect(results).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 
+  it('resolves tasks that return nothing', async () => {
+    const autoQueue = new AutoQueue<void>(10, 2);
+    let ran = 0;
+
+    await Promise.all(
+      [1, 2, 3].map(() =>
+        autoQueue.put(async () => {
+          ran++;
+          await Promise.resolve();
+        })
+      )
+    );
+
+    expect(ran).toBe(3);
+  });
+
   it('doesnt resolve tasks if flush is called', async () => {
     const autoQueue = new AutoQueue<number>(10, 2);
     const results: number[] = [];
